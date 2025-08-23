@@ -19,7 +19,7 @@ API_LIMITS = {
     "openrouteservice": int(os.getenv("OPENROUTESERVICE_DAILY_LIMIT", "800")),
     "sendgrid": int(os.getenv("SENDGRID_DAILY_LIMIT", "90")),
 }
-CRITICAL_APIS = set(["openweathermap", "openrouteservice"])  # if critical exhausted -> disable main features
+CRITICAL_APIS = set(["openweathermap", "openrouteservice"])
 WARN_THRESHOLD = 0.8
 
 def get_today():
@@ -61,18 +61,12 @@ def check_system_enabled(db: Session):
     return True
 
 def guard_api(api_name: str):
-    """
-    Decorator to guard external API calls. Expects `db` session passed as kwarg or in args.
-    Raises HTTPException 429 if limit exhausted.
-    """
     def decorator(func):
         @wraps(func)
         def wrapper(*args, **kwargs):
-            # find db session
             db = kwargs.get("db", None)
             if db is None:
                 for a in args:
-                    # heuristic: SQLAlchemy session has 'query' attr
                     if hasattr(a, "query"):
                         db = a
                         break
@@ -85,7 +79,6 @@ def guard_api(api_name: str):
                 logger.info("%s quota exhausted", api_name)
                 raise HTTPException(status_code=429, detail=f"Daily limit reached for {api_name}")
 
-            # warn if near threshold
             limit = API_LIMITS.get(api_name, DEFAULT_LIMIT)
             used = get_usage(db, api_name)
             if used >= int(limit * WARN_THRESHOLD):

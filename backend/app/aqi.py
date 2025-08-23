@@ -2,7 +2,11 @@
 import os, requests
 from typing import Optional, Dict
 from dotenv import load_dotenv
-load_dotenv()
+from pathlib import Path
+
+# ensure env loaded
+project_root = Path(__file__).resolve().parents[2]
+load_dotenv(dotenv_path=project_root / ".env")
 
 OWM_KEY = os.getenv("OPENWEATHERMAP_API_KEY")
 

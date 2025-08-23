@@ -41,4 +41,3 @@ class APIUsage(Base):
     api_name = Column(String(64), primary_key=True)
     date = Column(Date, primary_key=True)
     count = Column(Integer, default=0)
-

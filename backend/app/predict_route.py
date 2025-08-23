@@ -1,5 +1,4 @@
-# backend/app/predict_route.py
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from pathlib import Path
@@ -15,36 +14,44 @@ from .api_quota import guard_api, check_system_enabled
 from .utils.simple_cache import get_cache, set_cache
 from .predict import predict_from_vector, load_model
 from .gemini import call_gemini
+from .utils.email import send_alert_email
 
+# --------------------------------------------------------------------
+# Setup
+# --------------------------------------------------------------------
 logger = logging.getLogger(__name__)
-
 router = APIRouter(prefix="/api")
 
-# config
-DATASETS_DIR = Path(__file__).resolve().parents[1] / "datasets"
-STATIONS_CSV = DATASETS_DIR / "station.csv"
+DATASETS_DIR = Path(__file__).resolve().parents[2] / "datasets"
+STATIONS_CSV = DATASETS_DIR / "stations.csv"
 
-# Load station metadata safely and ensure lat/lon are floats
+# --------------------------------------------------------------------
+# Station metadata
+# --------------------------------------------------------------------
+if STATIONS_CSV.exists():
+    DATASETS_DIR = Path(__file__).resolve().parents[2] / "datasets"
+STATIONS_CSV = DATASETS_DIR / "stations.csv"
+
 if STATIONS_CSV.exists():
     try:
         stations_meta = pd.read_csv(STATIONS_CSV)
-        stations_meta.columns = [c.strip() for c in stations_meta.columns]
-        # ensure latitude/longitude exist and are floats
-        if "latitude" in stations_meta.columns and "longitude" in stations_meta.columns:
-            stations_meta["latitude"] = stations_meta["latitude"].astype(float)
-            stations_meta["longitude"] = stations_meta["longitude"].astype(float)
-        else:
-            # fallback to empty df with expected columns
-            stations_meta = pd.DataFrame(columns=["station_id", "latitude", "longitude"])
+        stations_meta.columns = [c.strip().lower() for c in stations_meta.columns]
+        stations_meta = stations_meta.rename(columns={"lat": "latitude", "lng": "longitude"})
+        stations_meta["latitude"] = stations_meta["latitude"].astype(float)
+        stations_meta["longitude"] = stations_meta["longitude"].astype(float)
     except Exception as e:
         logger.exception("Failed to load station CSV: %s", e)
         stations_meta = pd.DataFrame(columns=["station_id", "latitude", "longitude"])
 else:
+    logger.warning("stations.csv not found at %s", STATIONS_CSV)
     stations_meta = pd.DataFrame(columns=["station_id", "latitude", "longitude"])
 
 
-def haversine(lat1, lon1, lat2, lon2):
-    """Return distance in meters between two lat/lon points."""
+# --------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------
+def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Distance in meters between two lat/lon points."""
     R = 6371000.0
     phi1, phi2 = math.radians(lat1), math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
@@ -53,52 +60,45 @@ def haversine(lat1, lon1, lat2, lon2):
     return 2 * R * math.asin(math.sqrt(a))
 
 
-def find_nearest_station(lat, lon):
-    """Return (station_id, distance_m) or (None, None) if no stations."""
+def find_nearest_station(lat: float, lon: float):
+    """Find the nearest station by Haversine distance."""
     if stations_meta.empty:
-        return None, None
-    # compute distances vectorized is faster, but keep readability
-    dists = stations_meta.apply(lambda r: haversine(lat, lon, r["latitude"], r["longitude"]), axis=1)
-    idx = dists.idxmin()
-    return stations_meta.loc[idx, "station_id"], float(dists.loc[idx])
+        return None
+    stations_meta["dist"] = stations_meta.apply(
+        lambda r: haversine(lat, lon, r["latitude"], r["longitude"]), axis=1
+    )
+    nearest = stations_meta.loc[stations_meta["dist"].idxmin()]
+    return nearest.get("station_id", None)
 
 
-def sample_polyline(coords, step_m=300):
-    """
-    coords: list of [lon, lat] pairs (GeoJSON order)
-    returns list of (lat, lon) sampled approximately every step_m meters along the polyline
-    """
+def sample_polyline(coords, step_m: int = 300):
+    """Resample polyline geometry into evenly spaced waypoints."""
     sampled = []
 
     def segdist(a, b):
-        # a and b are [lon, lat]
         return haversine(a[1], a[0], b[1], b[0])
 
     for i in range(len(coords) - 1):
-        a = coords[i]
-        b = coords[i + 1]
+        a, b = coords[i], coords[i + 1]
         seglen = segdist(a, b)
         if seglen == 0:
             continue
-        # number of samples excluding the endpoint; ensure at least one step if segment long
         n = max(1, int(seglen // step_m))
         for s in range(n):
             t = s / n
             lon = a[0] + (b[0] - a[0]) * t
             lat = a[1] + (b[1] - a[1]) * t
             sampled.append((lat, lon))
-    # include final endpoint
     if coords:
         sampled.append((coords[-1][1], coords[-1][0]))
     return sampled
 
 
-# ---------------------------
-# Cached model loader (load once)
-# ---------------------------
+# --------------------------------------------------------------------
+# ML Model
+# --------------------------------------------------------------------
 _model_cache = None
 _feature_cols_cache = None
-
 
 def get_model():
     global _model_cache, _feature_cols_cache
@@ -107,105 +107,106 @@ def get_model():
     return _model_cache, _feature_cols_cache
 
 
-# ---------------------------
-# External API wrappers (guarded by quota)
-# ---------------------------
-
+# --------------------------------------------------------------------
+# External APIs
+# --------------------------------------------------------------------
 @guard_api("openrouteservice")
-def call_ors(db: Session, s_lat, s_lon, d_lat, d_lon):
+def call_ors(db: Session, s_lat: float, s_lon: float, d_lat: float, d_lon: float):
+    """Call OpenRouteService for driving routes."""
     ORS_KEY = os.getenv("OPENROUTESERVICE_API_KEY")
     if not ORS_KEY:
         raise HTTPException(status_code=500, detail="ORS key not configured")
-    url = "https://api.openrouteservice.org/v2/directions/driving-car"
+
+    url = "https://api.openrouteservice.org/v2/directions/driving-car/json"
+
+    headers = {"Authorization": ORS_KEY, "Content-Type": "application/json"}
     body = {
         "coordinates": [[s_lon, s_lat], [d_lon, d_lat]],
-        "instructions": False,
+        "options": {"instructions": False},
         "alternative_routes": {"share_factor": 0.6, "target_count": 3},
     }
-    headers = {"Authorization": ORS_KEY, "Content-Type": "application/json"}
+
     resp = requests.post(url, json=body, headers=headers, timeout=15)
     resp.raise_for_status()
     return resp.json()
 
 
 @guard_api("openweathermap")
-def call_owm(db: Session, lat, lon):
+def call_owm(db: Session, lat: float, lon: float):
+    """Call OpenWeatherMap Air Pollution API."""
     OWM_KEY = os.getenv("OPENWEATHERMAP_API_KEY")
     if not OWM_KEY:
         raise HTTPException(status_code=500, detail="OWM key not configured")
+
     url = "http://api.openweathermap.org/data/2.5/air_pollution"
-    r = requests.get(url, params={"lat": lat, "lon": lon, "appid": OWM_KEY}, timeout=10)
-    r.raise_for_status()
-    return r.json()
+    resp = requests.get(url, params={"lat": lat, "lon": lon, "appid": OWM_KEY}, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
 
 
-# helper: get latest reading from DB table latest_readings
 def get_latest_from_db(db: Session, station_id: str):
-    if station_id is None:
+    """Fetch latest air quality readings from DB."""
+    if not station_id:
         return None
     try:
         row = db.execute(
             text("SELECT station_id, pm2_5, pm10, no2, co, o3 FROM latest_readings WHERE station_id = :sid"),
             {"sid": station_id},
         ).first()
-        if row:
-            # SQLAlchemy Row -> mapping
-            return dict(row._mapping)
+        return dict(row._mapping) if row else None
     except Exception:
         logger.exception("DB query failed for station %s", station_id)
-    return None
+        return None
 
 
+# --------------------------------------------------------------------
+# Route Prediction Endpoint
+# --------------------------------------------------------------------
 @router.post("/predict-route")
-def predict_route(payload: dict, db: Session = Depends(get_db)):
-    """
-    payload example:
-    {
-      "source": "12.34,56.78",
-      "destination": "12.35,56.79"
-    }
-    """
-    # Ensure system not disabled due to critical quota exhaustion
+def predict_route(payload: dict, db: Session = Depends(get_db), bg: BackgroundTasks = None):
+    """Predict air quality along alternative driving routes."""
     check_system_enabled(db)
 
-    # parse payload
+    # Parse input
     try:
         s_lat, s_lon = map(float, payload["source"].split(","))
         d_lat, d_lon = map(float, payload["destination"].split(","))
     except Exception:
         raise HTTPException(status_code=400, detail="source/destination must be 'lat,lon'")
 
-    # load model once
     model, feature_cols = get_model()
 
-    # ORS with caching
+    # Fetch ORS routes (cached)
     ors_key = f"ors:{s_lat:.6f}:{s_lon:.6f}:{d_lat:.6f}:{d_lon:.6f}"
     ors_json = get_cache(ors_key)
     if ors_json is None:
         try:
-            ors_json = call_ors(db=db, s_lat=s_lat, s_lon=s_lon, d_lat=d_lat, d_lon=d_lon)
+            ors_json = call_ors(db, s_lat, s_lon, d_lat, d_lon)
             set_cache(ors_key, ors_json, ttl=600)
-        except HTTPException as e:
-            raise e
         except Exception:
             logger.exception("ORS call failed")
             raise HTTPException(status_code=502, detail="Route provider failed")
 
-    # ORS may return either 'features' (GeoJSON) or 'routes' (some variants).
-    if "features" in ors_json:
-        features = ors_json.get("features", [])
-    elif "routes" in ors_json:
-        # convert routes into a list of pseudo-features with geometry coordinates if possible
-        features = []
-        for r in ors_json.get("routes", []):
+    # Normalize features (FIXED)
+    features = []
+    if "routes" in ors_json:  # Standard ORS response
+        for r in ors_json["routes"]:
             geom = r.get("geometry")
-            if isinstance(geom, dict) and "coordinates" in geom:
-                features.append({"geometry": geom})
-            elif isinstance(geom, str):
-                # some responses are encoded polylines — leave handling to caller; skip
-                continue
-    else:
-        features = []
+            if geom:
+                if isinstance(geom, str):  # Encoded polyline
+                    try:
+                        from openrouteservice import convert
+                        coords = convert.decode_polyline(geom)["coordinates"]
+                    except Exception:
+                        logger.exception("Failed to decode ORS polyline")
+                        coords = []
+                elif isinstance(geom, dict) and "coordinates" in geom:
+                    coords = geom["coordinates"]
+                else:
+                    coords = []
+                features.append({"geometry": {"coordinates": coords}})
+    elif "features" in ors_json:  # GeoJSON-like
+        features = ors_json.get("features", [])
 
     route_summaries = []
     for i, feat in enumerate(features, start=1):
@@ -217,16 +218,16 @@ def predict_route(payload: dict, db: Session = Depends(get_db)):
         waypoint_preds = []
 
         for lat, lon in sampled:
-            station_id, dist = find_nearest_station(lat, lon)
+            # Prefer DB data, fallback to OWM
+            station_id = find_nearest_station(lat, lon)
             latest = get_latest_from_db(db, station_id)
+
             if latest is None:
-                # try cached OWM
                 owm_key = f"owm:{round(lat,4)}:{round(lon,4)}"
-                cached = get_cache(owm_key)
-                if cached is None:
+                latest = get_cache(owm_key)
+                if latest is None:
                     try:
-                        j = call_owm(db=db, lat=lat, lon=lon)
-                        # extract components safely
+                        j = call_owm(db, lat, lon)
                         comp = j.get("list", [{}])[0].get("components", {})
                         latest = {
                             "pm2_5": comp.get("pm2_5"),
@@ -236,75 +237,69 @@ def predict_route(payload: dict, db: Session = Depends(get_db)):
                             "o3": comp.get("o3"),
                         }
                         set_cache(owm_key, latest, ttl=600)
-                    except HTTPException:
-                        latest = None
                     except Exception:
                         logger.exception("OWM call failed for %s,%s", lat, lon)
                         latest = None
-                else:
-                    latest = cached
 
             if latest is None:
-                # unable to obtain environmental reading for this waypoint
                 continue
 
-            # build feature vector in same order as feature_columns
+            # Build feature vector
             vec = []
             for col in feature_cols:
-                val = None
-                # tolerant mapping
-                if col in latest:
-                    val = latest[col]
-                elif col.replace(".", "_") in latest:
-                    val = latest[col.replace(".", "_")]
-                elif col.lower() in latest:
-                    val = latest[col.lower()]
-                else:
-                    val = 0.0
+                val = latest.get(col) or latest.get(col.replace(".", "_")) or latest.get(col.lower()) or 0.0
                 try:
-                    vec.append(float(val) if val is not None else 0.0)
+                    vec.append(float(val))
                 except Exception:
                     vec.append(0.0)
 
-            # predict
             try:
-                preds = predict_from_vector(vec)  # expected list/array
+                preds = predict_from_vector(vec)
             except Exception:
                 logger.exception("Prediction failed for waypoint %s,%s", lat, lon)
                 preds = [None]
 
             waypoint_preds.append({"lat": lat, "lon": lon, "station": station_id, "pred": preds})
 
-        if not waypoint_preds:
-            # no waypoints with predictions for this route
-            continue
-
-        # build numpy array safely: filter out None entries
+        # Aggregate forecasts
         valid_preds = [w["pred"] for w in waypoint_preds if w["pred"] and w["pred"][0] is not None]
         if not valid_preds:
             continue
-        arr = np.array(valid_preds)
-        if arr.size == 0:
-            continue
 
-        # mean and max along axis 0
+        arr = np.array(valid_preds)
         mean_forecast = arr.mean(axis=0).tolist()
         max_forecast = arr.max(axis=0).tolist()
-        route_summaries.append(
-            {
-                "route_index": i,
-                "avg_forecast_pm2_5": mean_forecast,
-                "max_forecast_pm2_5": max_forecast,
-                "waypoints": len(waypoint_preds),
-            }
-        )
 
-    # Compose compact Gemini prompt & call (placeholder)
+        route_summaries.append({
+            "route_index": i,
+            "avg_forecast_pm2_5": mean_forecast,
+            "max_forecast_pm2_5": max_forecast,
+            "waypoints": len(waypoint_preds),
+        })
+
+    # ----------------------------------------------------------------
+    # Alerting
+    # ----------------------------------------------------------------
+    threshold = float(os.getenv("POLLUTION_ALERT_THRESHOLD", "150"))
+    for r in route_summaries:
+        maxv = r.get("max_forecast_pm2_5", [])
+        if maxv and maxv[0] and maxv[0] > threshold:
+            officer = os.getenv("ALERT_OFFICER_EMAIL")
+            if officer:
+                subject = f"High pollution alert: route {r['route_index']}"
+                content = f"Predicted PM2.5 peak: {maxv[0]:.1f}\nRoute waypoints: {r['waypoints']}"
+                if bg:
+                    bg.add_task(send_alert_email, officer, subject, content)
+                else:
+                    send_alert_email(officer, subject, content)
+
+    # ----------------------------------------------------------------
+    # Gemini summary
+    # ----------------------------------------------------------------
     prompt_lines = []
     for r in route_summaries:
         v = r.get("avg_forecast_pm2_5", [])
-        first = f"{v[0]:.1f}" if v and len(v) > 0 else "N/A"
-        prompt_lines.append(f"Route {r['route_index']}: avg1={first}")
+        prompt_lines.append(f"Route {r['route_index']}: avg1={v[0]:.1f}" if v else f"Route {r['route_index']}: avg1=N/A")
 
     prompt = "Compare routes and recommend best and whether to delay.\n" + "\n".join(prompt_lines)
     gemini_summary = call_gemini(prompt)
