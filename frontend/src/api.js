@@ -1,17 +1,29 @@
 // Centralized API calls for backend
 import axios from "axios";
 
-// If backend is a different origin/port, set baseURL here:
-// const API = axios.create({ baseURL: "http://localhost:8000" });
-const API = axios.create({ baseURL: "" }); // same-origin (CRA proxy can also be used)
+// Backend API base URL - adjust if backend runs on different port
+const API = axios.create({ 
+    baseURL: process.env.REACT_APP_API_URL || "http://localhost:8000",
+    timeout: 30000 // 30 second timeout for route predictions
+});
 
 export async function fetchStations() {
-    const r = await API.get("/api/stations");
-    return r.data || [];
+    try {
+        const r = await API.get("/api/stations");
+        return r.data || [];
+    } catch (error) {
+        console.error("Failed to fetch stations:", error);
+        throw error;
+    }
 }
 
 export async function predictRoute({ source, destination }) {
-  // source, destination: "lat,lon"
-    const r = await API.post("/api/predict-route", { source, destination });
-    return r.data;
+    // source, destination: "lat,lon"
+    try {
+        const r = await API.post("/api/predict-route", { source, destination });
+        return r.data;
+    } catch (error) {
+        console.error("Failed to predict route:", error);
+        throw error;
+    }
 }
